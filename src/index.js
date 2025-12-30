@@ -19,6 +19,7 @@ app.use(cookieParser());
 const allowedOrigins = [
   "http://localhost:5173",
   "https://yokohama-inventory-frontend-fbve.vercel.app",
+  "https://global-logistics-shipment-inventory.vercel.app",
   "*",
 ];
 app.use(
