@@ -4,8 +4,18 @@ const helmet = require("helmet");
 const morgan = require("morgan");
 const ApiError = require("./utils/api.error");
 const cookieParser = require("cookie-parser");
+const connectToDatabase = require("./db"); // for vercel
 const app = express();
-
+// for vercel this middleware
+app.use(async (req, res, next) => {
+  try {
+    await connectToDatabase();
+    next();
+  } catch (error) {
+    console.error("DB Connection Middleware Error:", error);
+    res.status(500).json({ error: "Database connection failed" });
+  }
+});
 // Import routes
 const authRoutes = require("./routes/auth.routes");
 const adminShipmentRoutes = require("./routes/admin/shipment.routes");
