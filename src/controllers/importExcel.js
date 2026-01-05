@@ -173,7 +173,7 @@ exports.importExcel = async (req, res) => {
         cleanRow["GATEOUT"] ||
         cleanRow["GATE OUT DATE"];
       const customer =
-        cleanRow["CUSTOMER"] ||
+        cleanRow["COMPANY NAME"] ||
         cleanRow["CUSTOMERS"] ||
         cleanRow["CLIENT"] ||
         cleanRow["CUSTOMER NAME"];
@@ -182,6 +182,7 @@ exports.importExcel = async (req, res) => {
         cleanRow["CHASSIS_NUMBER"] ||
         cleanRow["CHASSIS"] ||
         cleanRow["CHASSISNO"];
+      const remarks = cleanRow["REMARKS"];
 
       console.log(
         `Row ${rowNumber}: gateInRaw = "${gateInRaw}", type = ${typeof gateInRaw}`
@@ -240,8 +241,8 @@ exports.importExcel = async (req, res) => {
       ready.push({
         clientId: customerId,
         carId: {
-          makeModel: cleanRow["MAKER/MODEL"]
-            ? String(cleanRow["MAKER/MODEL"]).trim().toUpperCase()
+          makeModel: cleanRow["MAKER MODEL"]
+            ? String(cleanRow["MAKER MODEL"]).trim().toUpperCase()
             : "",
           chassisNumber: chassisUpper,
           images: [],
@@ -258,16 +259,15 @@ exports.importExcel = async (req, res) => {
           ? String(cleanRow["POD"]).trim().toUpperCase()
           : undefined,
         jobNumber:
-          cleanRow["JOB NO"] || cleanRow["JOB_NO"] || cleanRow["JOBNO"]
-            ? String(
-                cleanRow["JOB NO"] || cleanRow["JOB_NO"] || cleanRow["JOBNO"]
-              )
+          cleanRow["JOB"] || cleanRow["JOB_"] || cleanRow["JOBNO"]
+            ? String(cleanRow["JOB"] || cleanRow["JOB_NO"] || cleanRow["JOBNO"])
                 .trim()
                 .toUpperCase()
             : undefined,
         exportStatus: gateOutDate ? "shipped" : "pending",
         storageDays: gateOutDate ? storageDays(gateInDate, gateOutDate) : 0,
         importedAt: new Date(),
+        remarks: String(remarks)?.trim() || undefined,
       });
     }
 
@@ -376,5 +376,46 @@ exports.fixShipmentDates = async (req, res) => {
     });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
+  }
+};
+
+exports.fixdates = async (req, res) => {
+  try {
+    const ONE_DAY = 24 * 60 * 60 * 1000;
+
+    const result = await Shipment.updateMany(
+      {}, // all shipments
+      [
+        {
+          $set: {
+            gateInDate: { $add: ["$gateInDate", ONE_DAY] },
+            gateOutDate: {
+              $cond: {
+                if: { $ne: ["$gateOutDate", null] },
+                then: { $add: ["$gateOutDate", ONE_DAY] },
+                else: "$gateOutDate",
+              },
+            },
+          },
+        },
+        {
+          $set: { createdAt: "$gateInDate" },
+        },
+      ]
+    );
+
+    res.status(200).json({
+      success: true,
+      message: "All shipment dates updated successfully",
+      matched: result.matchedCount,
+      modified: result.modifiedCount,
+    });
+  } catch (error) {
+    console.error("Bulk date update error:", error);
+    res.status(500).json({
+      success: false,
+      message: "Failed to update shipments",
+      error: error.message,
+    });
   }
 };

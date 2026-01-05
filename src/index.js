@@ -6,7 +6,7 @@ const ApiError = require("./utils/api.error");
 const cookieParser = require("cookie-parser");
 const connectToDatabase = require("./db"); // for vercel
 const app = express();
-// for vercel this middleware
+// for vercel to have cached db this middleware helps
 app.use(async (req, res, next) => {
   try {
     await connectToDatabase();

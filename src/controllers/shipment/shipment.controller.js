@@ -132,7 +132,11 @@ exports.listShipments = asyncHandler(async (req, res) => {
 
     // 1. Match with filters
     pipeline.push({ $match: filter });
-
+    pipeline.push({
+      $match: {
+        [safeSortBy]: { $exists: true, $ne: null },
+      },
+    });
     // 2. Sort
     pipeline.push({ $sort: sortOptions });
 

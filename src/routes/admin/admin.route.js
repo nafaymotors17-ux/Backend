@@ -25,5 +25,5 @@ router.delete(
 router.get("/stats/dashboard", statsController.getStats);
 router.get("/stats/gates", statsController.getGateStats);
 
-router.post("/excel", importExcelController.fixShipmentDates);
+// router.post("/excel", importExcelController.fixdates);
 module.exports = router;
