@@ -3,16 +3,11 @@ const ApiError = require("../../utils/api.error");
 const ApiResponse = require("../../utils/api.response");
 const asyncHandler = require("../../utils/asyncHandler");
 const mongoose = require("mongoose");
-const { get, set, del, keys, clearShipmentCache } = require("../cache"); // ✅ must have keys() in cache.js
-const crypto = require("crypto");
-
+const Vessel = require("../../models/vessel.model.js");
 // const triggerDeletePhotos = require("../../aws/lambda/deleteCarPhotos");
 const escapeRegex = (str = "") => str.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"); // safe regex escape
 const { calculateStoragePeriod } = require("../../utils/storage.days.calc.js");
 const { deletePhotosFromS3 } = require("../../utils/s3DeleteHelper.js");
-// Helper: stable hash for filters
-const filterHash = (filters) =>
-  crypto.createHash("md5").update(JSON.stringify(filters)).digest("hex");
 
 exports.listShipments = asyncHandler(async (req, res) => {
   const {
@@ -26,6 +21,7 @@ exports.listShipments = asyncHandler(async (req, res) => {
     dateTo,
     chassisNumber,
     jobNumber,
+    pod,
     inYard,
     sortBy = "createdAt",
     sortOrder = "desc",
@@ -44,11 +40,67 @@ exports.listShipments = asyncHandler(async (req, res) => {
 
   if (clientId) filter.clientId = clientId;
   if (yard) filter.yard = { $regex: escapeRegex(yard), $options: "i" };
-  if (vesselName)
-    filter.vesselName = { $regex: escapeRegex(vesselName), $options: "i" };
+
+  // Vessel filtering - find matching vessel IDs first (FAST - uses indexed vesselId)
+  // This is faster than doing lookup on all shipments
+  if (vesselName && vesselName.trim()) {
+    const vesselNameRegex = {
+      $regex: escapeRegex(vesselName.trim()),
+      $options: "i",
+    };
+    const matchingVessels = await Vessel.find(
+      { vesselName: vesselNameRegex },
+      { _id: 1 }
+    ).lean();
+    const vesselIds = matchingVessels.map((v) => v._id);
+    if (vesselIds.length > 0) {
+      filter.vesselId = { $in: vesselIds };
+    } else {
+      // No vessels found - return empty results
+      filter.vesselId = { $in: [] };
+    }
+  }
+
+  // Job number and POD filtering - find matching vessel IDs first
+  const vesselFilterConditions = {};
+  if (jobNumber && jobNumber.trim()) {
+    vesselFilterConditions.jobNumber = {
+      $regex: escapeRegex(jobNumber.trim()),
+      $options: "i",
+    };
+  }
+  if (pod && pod.trim()) {
+    vesselFilterConditions.pod = {
+      $regex: escapeRegex(pod.trim()),
+      $options: "i",
+    };
+  }
+
+  // If we have vessel filter conditions, find matching vessels
+  if (Object.keys(vesselFilterConditions).length > 0) {
+    const matchingVessels = await Vessel.find(vesselFilterConditions, {
+      _id: 1,
+    }).lean();
+    const vesselIds = matchingVessels.map((v) => v._id);
+    if (vesselIds.length > 0) {
+      // If vesselName filter already exists, combine with AND (intersect)
+      if (filter.vesselId && filter.vesselId.$in) {
+        const existingIds = filter.vesselId.$in;
+        filter.vesselId = {
+          $in: vesselIds.filter((id) =>
+            existingIds.some((eid) => eid.toString() === id.toString())
+          ),
+        };
+      } else {
+        filter.vesselId = { $in: vesselIds };
+      }
+    } else {
+      // No vessels found - return empty results
+      filter.vesselId = { $in: [] };
+    }
+  }
+
   if (exportStatus) filter.exportStatus = exportStatus;
-  if (jobNumber)
-    filter.jobNumber = { $regex: escapeRegex(jobNumber), $options: "i" };
   if (inYard) filter.storageDays = 0;
 
   // -------------------- DATE RANGE FILTER --------------------
@@ -94,10 +146,10 @@ exports.listShipments = asyncHandler(async (req, res) => {
   const allowedSortFields = [
     "gateInDate",
     "createdAt",
-    "vesselName",
+    "vessel.vesselName", // Vessel entity
+    "vessel.jobNumber", // Vessel entity
+    "vessel.pod", // Vessel entity
     "yard",
-    "jobNumber",
-    "pod",
     "exportStatus",
     "storageDays",
   ];
@@ -107,182 +159,211 @@ exports.listShipments = asyncHandler(async (req, res) => {
     ? sortOrder
     : "desc";
 
-  const sortOptions = {};
-  sortOptions[safeSortBy] = normalizedSortOrder === "asc" ? 1 : -1;
-  sortOptions.createdAt = normalizedSortOrder === "asc" ? 1 : -1;
+  // -------------------- FETCH DATA --------------------
+  const skip = (pageNum - 1) * limitNum;
 
-  // -------------------- CACHE KEY --------------------
-  const filterSignature = Object.keys(filter).length
-    ? filterHash(filter)
-    : "nofilter";
-  const sortSignature = `${safeSortBy}_${normalizedSortOrder}`;
-  const cacheKeyPrefix = `shipments_${filterSignature}_${sortSignature}`;
-  const cacheKey = `${cacheKeyPrefix}_${pageNum}`;
+  // -------------------- OPTIMIZED AGGREGATION PIPELINE --------------------
+  const pipeline = [];
 
-  // -------------------- FETCH FUNCTION --------------------
-  const fetchAndCache = async (pageToFetch) => {
-    const key = `${cacheKeyPrefix}_${pageToFetch}`;
-    const cached = get(key);
-    if (cached) return cached;
+  // 1. Match with filters (vesselId filtering already done above - FAST!)
+  pipeline.push({ $match: filter });
 
-    const skip = (pageToFetch - 1) * limitNum;
+  // 2. Check if we need vessel lookup for sorting
+  const needsVesselLookupForSort =
+    safeSortBy === "vessel.vesselName" ||
+    safeSortBy === "vessel.jobNumber" ||
+    safeSortBy === "vessel.pod";
 
-    // -------------------- OPTIMIZED AGGREGATION PIPELINE --------------------
-    const pipeline = [];
-
-    // 1. Match with filters
-    pipeline.push({ $match: filter });
+  // 3. Sorting - only do vessel lookup if sorting by vessel fields
+  if (needsVesselLookupForSort) {
+    // For vessel sorting: lookup vessel, sort, then paginate
     pipeline.push({
-      $match: {
-        [safeSortBy]: { $exists: true, $ne: null },
+      $lookup: {
+        from: "vessels",
+        localField: "vesselId",
+        foreignField: "_id",
+        as: "vessel",
       },
     });
-    // 2. Sort
-    pipeline.push({ $sort: sortOptions });
-
-    // 3. Facet to get both count and paginated data in one query
     pipeline.push({
-      $facet: {
-        metadata: [{ $count: "totalItems" }],
-        data: [
-          { $skip: skip },
-          { $limit: limitNum },
-
-          // FIXED: Add imageCount INSIDE carId object
-          {
-            $addFields: {
-              "carId.imageCount": {
-                $cond: {
-                  if: { $isArray: "$carId.images" },
-                  then: { $size: "$carId.images" },
-                  else: 0,
-                },
-              },
-            },
-          },
-
-          // Remove the images array to reduce payload
-          {
-            $addFields: {
-              "carId.images": "$$REMOVE",
-            },
-          },
-
-          // Lookup client
-          {
-            $lookup: {
-              from: "users",
-              localField: "clientId",
-              foreignField: "_id",
-              as: "clientId",
-            },
-          },
-          {
-            $unwind: {
-              path: "$clientId",
-              preserveNullAndEmptyArrays: true,
-            },
-          },
-          // Format the response - match your original response structure
-          {
-            $project: {
-              // Shipment fields
-              gateInDate: 1,
-              gateOutDate: 1,
-              vesselName: 1,
-              yard: 1,
-              pod: 1,
-              jobNumber: 1,
-              storageDays: 1,
-              exportStatus: 1,
-              chassisNumber: 1,
-              chassisNumberReversed: 1,
-              remarks: 1,
-              createdAt: 1,
-              updatedAt: 1,
-
-              // Car fields - includes imageCount inside carId
-              carId: {
-                makeModel: "$carId.makeModel",
-                chassisNumber: "$carId.chassisNumber",
-                imageCount: "$carId.imageCount",
-              },
-
-              // Client fields
-              "clientId._id": 1,
-              "clientId.name": 1,
-              "clientId.userId": 1,
-              "clientId.email": 1,
-            },
-          },
-        ],
+      $unwind: {
+        path: "$vessel",
+        preserveNullAndEmptyArrays: true,
       },
     });
-
-    // Execute aggregation
-    const result = await Shipment.aggregate(pipeline).allowDiskUse(true);
-
-    // Extract data from facet result
-    const metadata = result[0]?.metadata[0] || { totalItems: 0 };
-    const docs = result[0]?.data || [];
-    const totalItems = metadata.totalItems;
-
-    // Format response
-    const response = ApiResponse.paginated(
-      "Shipments retrieved successfully",
-      docs,
-      {
-        currentPage: pageToFetch,
-        totalPages: Math.ceil(totalItems / limitNum),
-        totalItems,
-        itemsPerPage: limitNum,
-        hasNextPage: pageToFetch * limitNum < totalItems,
-        hasPrevPage: pageToFetch > 1,
-        sortBy: safeSortBy,
-        sortOrder: normalizedSortOrder,
-      }
-    );
-
-    // Cache the response
-    set(key, response);
-    return response;
-  };
-
-  // -------------------- MAIN RESPONSE --------------------
-  const cached = get(cacheKey);
-  let response;
-
-  if (cached) {
-    console.log(`✅ Cache hit for ${cacheKey}`);
-    response = cached;
+    pipeline.push({
+      $addFields: {
+        sortVesselName: "$vessel.vesselName",
+        sortVesselJobNumber: "$vessel.jobNumber",
+        sortVesselPod: "$vessel.pod",
+      },
+    });
+    pipeline.push({
+      $sort: (() => {
+        const sortOpts = {};
+        if (safeSortBy === "vessel.vesselName") {
+          sortOpts.sortVesselName = normalizedSortOrder === "asc" ? 1 : -1;
+        } else if (safeSortBy === "vessel.jobNumber") {
+          sortOpts.sortVesselJobNumber = normalizedSortOrder === "asc" ? 1 : -1;
+        } else if (safeSortBy === "vessel.pod") {
+          sortOpts.sortVesselPod = normalizedSortOrder === "asc" ? 1 : -1;
+        }
+        sortOpts.createdAt = -1; // Secondary sort
+        return sortOpts;
+      })(),
+    });
   } else {
-    console.log(`⚙️ Fetching from DB for ${cacheKey}`);
-    response = await fetchAndCache(pageNum);
+    // For all other sorts: sort on indexed fields first (FAST!), then paginate
+    pipeline.push({
+      $sort: (() => {
+        const sortOpts = {};
+        sortOpts[safeSortBy] = normalizedSortOrder === "asc" ? 1 : -1;
+        sortOpts.createdAt = -1; // Secondary sort
+        return sortOpts;
+      })(),
+    });
   }
 
+  // 4. Facet to get both count and paginated data
+  pipeline.push({
+    $facet: {
+      metadata: [{ $count: "totalItems" }],
+      data: [
+        { $skip: skip },
+        { $limit: limitNum },
+
+        // Now do lookups ONLY on paginated results (much faster!)
+        {
+          $lookup: {
+            from: "users",
+            localField: "clientId",
+            foreignField: "_id",
+            as: "clientId",
+          },
+        },
+        {
+          $unwind: {
+            path: "$clientId",
+            preserveNullAndEmptyArrays: true,
+          },
+        },
+        // Only lookup vessel if we didn't already do it for sorting
+        ...(needsVesselLookupForSort
+          ? []
+          : [
+              {
+                $lookup: {
+                  from: "vessels",
+                  localField: "vesselId",
+                  foreignField: "_id",
+                  as: "vessel",
+                },
+              },
+              {
+                $unwind: {
+                  path: "$vessel",
+                  preserveNullAndEmptyArrays: true,
+                },
+              },
+            ]),
+
+        // FIXED: Add imageCount INSIDE carId object
+        {
+          $addFields: {
+            "carId.imageCount": {
+              $cond: {
+                if: { $isArray: "$carId.images" },
+                then: { $size: "$carId.images" },
+                else: 0,
+              },
+            },
+          },
+        },
+
+        // Remove the images array to reduce payload
+        {
+          $addFields: {
+            "carId.images": "$$REMOVE",
+          },
+        },
+        // Format the response - use vessel data from lookup
+        {
+          $project: {
+            // Shipment fields
+            gateInDate: 1,
+            gateOutDate: 1,
+            vesselId: 1,
+            yard: 1,
+            // jobNumber removed - now in vessel entity
+            storageDays: 1,
+            exportStatus: 1,
+            chassisNumber: 1,
+            chassisNumberReversed: 1,
+            remarks: 1,
+            createdAt: 1,
+            updatedAt: 1,
+
+            // Car fields - includes imageCount inside carId
+            carId: {
+              makeModel: "$carId.makeModel",
+              chassisNumber: "$carId.chassisNumber",
+              imageCount: "$carId.imageCount",
+            },
+
+            // Client fields
+            "clientId._id": 1,
+            "clientId.name": 1,
+            "clientId.userId": 1,
+            "clientId.email": 1,
+
+            // Vessel fields - use vessel data from entity
+            vessel: {
+              _id: "$vessel._id",
+              vesselName: "$vessel.vesselName",
+              jobNumber: "$vessel.jobNumber",
+              etd: "$vessel.etd",
+              shippingLine: "$vessel.shippingLine",
+              pod: "$vessel.pod",
+            },
+            // Remove sort fields if they exist
+            ...(needsVesselLookupForSort
+              ? {
+                  sortVesselName: "$$REMOVE",
+                  sortVesselJobNumber: "$$REMOVE",
+                  sortVesselPod: "$$REMOVE",
+                }
+              : {}),
+          },
+        },
+      ],
+    },
+  });
+
+  // Execute aggregation
+  const result = await Shipment.aggregate(pipeline).allowDiskUse(true);
+
+  // Extract data from facet result
+  const metadata = result[0]?.metadata[0] || { totalItems: 0 };
+  const docs = result[0]?.data || [];
+  const totalItems = metadata.totalItems;
+
+  // Format response
+  const response = ApiResponse.paginated(
+    "Shipments retrieved successfully",
+    docs,
+    {
+      currentPage: pageNum,
+      totalPages: Math.ceil(totalItems / limitNum),
+      totalItems,
+      itemsPerPage: limitNum,
+      hasNextPage: pageNum * limitNum < totalItems,
+      hasPrevPage: pageNum > 1,
+      sortBy: safeSortBy,
+      sortOrder: normalizedSortOrder,
+    }
+  );
+
   res.status(200).json(response);
-
-  // -------------------- PREFETCH --------------------
-  [pageNum - 1, pageNum + 1].forEach((p) => {
-    if (p > 0 && !get(`${cacheKeyPrefix}_${p}`)) {
-      fetchAndCache(p).catch((err) => {
-        console.error("Prefetch failed for page", p, err);
-      });
-    }
-  });
-
-  // -------------------- CACHE CLEANUP --------------------
-  const allKeys = keys().filter((k) => k.startsWith(cacheKeyPrefix));
-  const keepPages = [pageNum - 1, pageNum, pageNum + 1];
-
-  allKeys.forEach((k) => {
-    const match = k.match(/_(\d+)$/);
-    const p = match ? parseInt(match[1]) : null;
-    if (p && !keepPages.includes(p)) {
-      del(k);
-      console.log(`🗑️ Removed cache ${k}`);
-    }
-  });
 });
 
 const VALID_EXPORT_STATUSES = ["pending", "shipped", "unshipped", "cancelled"];
@@ -294,11 +375,10 @@ exports.createShipment = asyncHandler(async (req, res) => {
       chassisNo,
       gateInDate,
       gateOutDate,
-      vessel: vesselName,
+      vesselId, // Use vesselId
       yard,
-      pod,
       // glNumber,
-      jobNumber,
+      // jobNumber removed - now in vessel entity
       exportStatus = "pending",
       remarks,
     } = req.body;
@@ -356,11 +436,20 @@ exports.createShipment = asyncHandler(async (req, res) => {
     };
 
     if (gateOut) shipmentData.gateOutDate = gateOut;
-    if (vesselName) shipmentData.vesselName = vesselName;
+
+    // Use vesselId if provided
+    if (vesselId && mongoose.Types.ObjectId.isValid(vesselId)) {
+      const vessel = await Vessel.findById(vesselId);
+      if (vessel) {
+        shipmentData.vesselId = vessel._id;
+      } else {
+        throw ApiError.notFound("Vessel not found");
+      }
+    }
+
     if (yard) shipmentData.yard = yard;
-    if (pod) shipmentData.pod = pod;
     // if (job) shipmentData.glNumber = glNumber;
-    if (jobNumber) shipmentData.jobNumber = jobNumber;
+    // jobNumber removed - now in vessel entity
     if (remarks) shipmentData.remarks = remarks;
     const shipment = new Shipment(shipmentData);
     await shipment.save();
@@ -374,7 +463,6 @@ exports.createShipment = asyncHandler(async (req, res) => {
         userId: clientId.userId,
       },
     };
-    clearShipmentCache();
     return res
       .status(201)
       .json(ApiResponse.created("Shipment created successfully", populated));
@@ -419,11 +507,10 @@ exports.updateShipment = asyncHandler(async (req, res) => {
       chassisNumber,
       gateInDate,
       gateOutDate,
-      vesselName,
+      vesselId, // Use vesselId
       yard,
-      pod,
       // glNumber,
-      jobNumber,
+      // jobNumber removed - now in vessel entity
       exportStatus,
       remarks,
     } = sanitizedBody;
@@ -438,9 +525,6 @@ exports.updateShipment = asyncHandler(async (req, res) => {
     // 2️⃣ Normalize input
     // chassisNumber is guaranteed to be non-falsy here.
     const newChassis = chassisNumber.toUpperCase();
-
-    // If jobNumber is undefined (from "" or missing), use the existing value for the check.
-    const newJob = jobNumber ?? shipment.jobNumber;
 
     // 3️⃣ Check uniqueness (Logic remains correct for checking normalized values)
 
@@ -501,30 +585,34 @@ exports.updateShipment = asyncHandler(async (req, res) => {
         : 0;
     }
 
+    // --- Vessel Handling - Use vesselId ---
+    if (originalBody.hasOwnProperty("vesselId")) {
+      if (vesselId && mongoose.Types.ObjectId.isValid(vesselId)) {
+        const vessel = await Vessel.findById(vesselId);
+        if (vessel) {
+          shipment.vesselId = vessel._id;
+        } else {
+          throw ApiError.notFound("Vessel not found");
+        }
+      } else if (vesselId === null || vesselId === "") {
+        // Allow clearing vessel
+        shipment.vesselId = null;
+      } else {
+        throw ApiError.badRequest("Invalid vessel ID format");
+      }
+    }
+
     // --- Optional String Fields (The core fix for "" -> undefined) ---
 
     // Pattern: if the field was sent in the request, set the shipment property to the
     // sanitized value (non-empty string or undefined). Mongoose will omit `undefined`.
-
-    if (originalBody.hasOwnProperty("vesselName")) {
-      shipment.vesselName = vesselName
-        ? vesselName.trim().toUpperCase()
-        : undefined;
-    }
     if (originalBody.hasOwnProperty("yard")) {
       shipment.yard = yard ? yard.trim() : undefined;
-    }
-    // You sent 'pod' as "TOKYO", which is a valid update. This should work correctly:
-    if (originalBody.hasOwnProperty("pod")) {
-      shipment.pod = pod ? pod.trim().toUpperCase() : undefined;
     }
     // if (originalBody.hasOwnProperty("glNumber")) {
     //   shipment.glNumber = glNumber ? glNumber.trim() : undefined;
     // }
-    if (originalBody.hasOwnProperty("jobNumber")) {
-      // Use `jobNumber` from the sanitized body, which is undefined if input was "".
-      shipment.jobNumber = jobNumber ? jobNumber.trim() : undefined;
-    }
+    // jobNumber removed - now in vessel entity
     if (originalBody.hasOwnProperty("exportStatus")) {
       shipment.exportStatus = exportStatus; // Status is validated separately
     }
@@ -534,7 +622,6 @@ exports.updateShipment = asyncHandler(async (req, res) => {
 
     await shipment.save();
 
-    clearShipmentCache();
     // ... (response logic)
     const populated = {
       ...shipment.toObject(),
@@ -577,8 +664,6 @@ exports.updateRemarks = asyncHandler(async (req, res) => {
 
   await shipment.save();
 
-  clearShipmentCache();
-
   const response = ApiResponse.success(
     "Remarks updated successfully",
     shipment.toObject()
@@ -595,8 +680,6 @@ exports.deleteShipment = asyncHandler(async (req, res) => {
 
   const deletedShipment = await Shipment.findOneAndDelete({ _id: shipmentId });
   if (!deletedShipment) throw new Error("Shipment not found");
-
-  clearShipmentCache();
 
   // Delete photos immediately (Promise)
   if (
@@ -635,9 +718,6 @@ exports.deleteShipments = asyncHandler(async (req, res) => {
 
   // Delete MongoDB records
   await Shipment.deleteMany({ _id: { $in: ids } });
-
-  // Clear cache
-  clearShipmentCache();
 
   // Delete S3 photos only for shipments that have photos
   if (chassisNumbers.length > 0) {
@@ -882,6 +962,7 @@ exports.exportShipmentsExcel = asyncHandler(async (req, res) => {
     dateTo,
     chassisNumber,
     jobNumber,
+    pod,
     inYard,
   } = req.query;
 
@@ -889,11 +970,62 @@ exports.exportShipmentsExcel = asyncHandler(async (req, res) => {
 
   if (clientId) filter.clientId = new mongoose.Types.ObjectId(clientId);
   if (yard) filter.yard = { $regex: escapeRegex(yard), $options: "i" };
-  if (vesselName)
-    filter.vesselName = { $regex: escapeRegex(vesselName), $options: "i" };
+
+  // Vessel filtering - find matching vessel IDs first (same as listShipments)
+  if (vesselName && vesselName.trim()) {
+    const vesselNameRegex = {
+      $regex: escapeRegex(vesselName.trim()),
+      $options: "i",
+    };
+    const matchingVessels = await Vessel.find(
+      { vesselName: vesselNameRegex },
+      { _id: 1 }
+    ).lean();
+    const vesselIds = matchingVessels.map((v) => v._id);
+    if (vesselIds.length > 0) {
+      filter.vesselId = { $in: vesselIds };
+    } else {
+      filter.vesselId = { $in: [] };
+    }
+  }
+
+  // Job number and POD filtering - find matching vessel IDs
+  const vesselFilterConditions = {};
+  if (jobNumber && jobNumber.trim()) {
+    vesselFilterConditions.jobNumber = {
+      $regex: escapeRegex(jobNumber.trim()),
+      $options: "i",
+    };
+  }
+  if (pod && pod.trim()) {
+    vesselFilterConditions.pod = {
+      $regex: escapeRegex(pod.trim()),
+      $options: "i",
+    };
+  }
+
+  if (Object.keys(vesselFilterConditions).length > 0) {
+    const matchingVessels = await Vessel.find(vesselFilterConditions, {
+      _id: 1,
+    }).lean();
+    const vesselIds = matchingVessels.map((v) => v._id);
+    if (vesselIds.length > 0) {
+      if (filter.vesselId && filter.vesselId.$in) {
+        const existingIds = filter.vesselId.$in;
+        filter.vesselId = {
+          $in: vesselIds.filter((id) =>
+            existingIds.some((eid) => eid.toString() === id.toString())
+          ),
+        };
+      } else {
+        filter.vesselId = { $in: vesselIds };
+      }
+    } else {
+      filter.vesselId = { $in: [] };
+    }
+  }
+
   if (exportStatus) filter.exportStatus = exportStatus;
-  if (jobNumber)
-    filter.jobNumber = { $regex: escapeRegex(jobNumber), $options: "i" };
   if (inYard === "true") filter.storageDays = { $eq: 0 };
 
   if (dateFrom || dateTo) {
@@ -1022,8 +1154,8 @@ exports.exportShipmentsExcel = asyncHandler(async (req, res) => {
     });
     headerRow.commit();
 
-    // Fetch filtered data
-    const cursor = Shipment.aggregate([
+    // Fetch filtered data with vessel lookup
+    const exportPipeline = [
       { $match: filter },
       {
         $lookup: {
@@ -1035,13 +1167,29 @@ exports.exportShipmentsExcel = asyncHandler(async (req, res) => {
       },
       { $unwind: { path: "$client", preserveNullAndEmptyArrays: true } },
       {
+        $lookup: {
+          from: "vessels",
+          localField: "vesselId",
+          foreignField: "_id",
+          as: "vessel",
+        },
+      },
+      {
+        $unwind: {
+          path: "$vessel",
+          preserveNullAndEmptyArrays: true,
+        },
+      },
+      // Vessel filtering already done via vesselId in $match stage above
+      // No need for additional vessel filtering here
+      {
         $project: {
           gateInDate: 1,
           gateOutDate: 1,
-          vesselName: 1,
+          vesselName: "$vessel.vesselName",
           yard: 1,
-          jobNumber: 1,
-          pod: 1,
+          jobNumber: "$vessel.jobNumber",
+          pod: "$vessel.pod",
           exportStatus: 1,
           storageDays: 1,
           clientName: "$client.name",
@@ -1052,7 +1200,11 @@ exports.exportShipmentsExcel = asyncHandler(async (req, res) => {
           remarks: 1,
         },
       },
-    ]).cursor({ batchSize: 500 });
+    ];
+
+    const cursor = Shipment.aggregate(exportPipeline).cursor({
+      batchSize: 500,
+    });
 
     let total = 0;
     for await (const s of cursor) {
@@ -1212,10 +1364,8 @@ exports.getShipmentById = asyncHandler(async (req, res) => {
         clientId: 1, // Keep original ObjectId reference for saving
         gateInDate: 1,
         gateOutDate: 1,
-        vesselName: 1,
+        vesselId: 1,
         yard: 1,
-        pod: 1,
-        jobNumber: 1,
         storageDays: 1,
         exportStatus: 1,
         chassisNumber: 1,
@@ -1251,6 +1401,21 @@ exports.getShipmentById = asyncHandler(async (req, res) => {
         },
       },
     },
+    // Lookup vessel for vessel data
+    {
+      $lookup: {
+        from: "vessels",
+        localField: "vesselId",
+        foreignField: "_id",
+        as: "vessel",
+      },
+    },
+    {
+      $unwind: {
+        path: "$vessel",
+        preserveNullAndEmptyArrays: true,
+      },
+    },
     // Add client info to clientId object for frontend compatibility
     {
       $addFields: {
@@ -1266,6 +1431,15 @@ exports.getShipmentById = asyncHandler(async (req, res) => {
             },
             else: "$clientId", // Keep original ObjectId if no client found
           },
+        },
+        // Add vessel data
+        vessel: {
+          _id: "$vessel._id",
+          vesselName: "$vessel.vesselName",
+          jobNumber: "$vessel.jobNumber",
+          etd: "$vessel.etd",
+          shippingLine: "$vessel.shippingLine",
+          pod: "$vessel.pod",
         },
       },
     },
@@ -1288,6 +1462,121 @@ exports.getShipmentById = asyncHandler(async (req, res) => {
   const response = ApiResponse.success(
     "Shipment retrieved successfully",
     shipment
+  );
+
+  res.status(response.statusCode).json(response);
+});
+
+/**
+ * Bulk assign vessel to multiple shipments
+ */
+exports.bulkAssignVessel = asyncHandler(async (req, res) => {
+  const { shipmentIds, vesselId } = req.body;
+
+  if (!Array.isArray(shipmentIds) || shipmentIds.length === 0) {
+    throw ApiError.badRequest("Please provide shipment IDs");
+  }
+
+  if (!vesselId || !mongoose.Types.ObjectId.isValid(vesselId)) {
+    throw ApiError.badRequest("Valid vessel ID is required");
+  }
+
+  // Convert shipmentIds to ObjectIds and validate
+  const validShipmentIds = shipmentIds
+    .filter((id) => mongoose.Types.ObjectId.isValid(id))
+    .map((id) => new mongoose.Types.ObjectId(id));
+
+  if (validShipmentIds.length === 0) {
+    throw ApiError.badRequest("No valid shipment IDs provided");
+  }
+
+  // Verify vessel exists
+
+  const vessel = await Vessel.findById(vesselId);
+  if (!vessel) {
+    throw ApiError.notFound("Vessel not found");
+  }
+
+  // Update shipments
+  const result = await Shipment.updateMany(
+    { _id: { $in: validShipmentIds } },
+    {
+      $set: {
+        vesselId: vessel._id,
+        // Also update vesselName for backward compatibility
+        vesselName: vessel.vesselName,
+      },
+    }
+  );
+
+  if (result.matchedCount === 0) {
+    throw ApiError.notFound("No shipments found");
+  }
+
+  const response = ApiResponse.success(
+    `Vessel assigned to ${result.modifiedCount} shipment(s)`,
+    {
+      matchedCount: result.matchedCount,
+      modifiedCount: result.modifiedCount,
+      vessel: {
+        _id: vessel._id,
+        vesselName: vessel.vesselName,
+      },
+    }
+  );
+
+  res.status(response.statusCode).json(response);
+});
+
+/**
+ * Bulk assign gate out date to multiple shipments
+ */
+exports.bulkAssignGateOutDate = asyncHandler(async (req, res) => {
+  const { shipmentIds, gateOutDate } = req.body;
+
+  if (!Array.isArray(shipmentIds) || shipmentIds.length === 0) {
+    throw ApiError.badRequest("Please provide shipment IDs");
+  }
+
+  if (!gateOutDate) {
+    throw ApiError.badRequest("Gate out date is required");
+  }
+
+  const gateOut = new Date(gateOutDate);
+
+  // Fetch shipments to calculate storage days
+  const shipments = await Shipment.find({ _id: { $in: shipmentIds } });
+
+  if (shipments.length === 0) {
+    throw ApiError.notFound("No shipments found");
+  }
+
+  // Update each shipment with gate out date and recalculate storage days
+  const updatePromises = shipments.map(async (shipment) => {
+    const storageDays = shipment.gateInDate
+      ? calculateStoragePeriod(shipment.gateInDate, gateOut)
+      : 0;
+
+    return Shipment.findByIdAndUpdate(
+      shipment._id,
+      {
+        $set: {
+          gateOutDate: gateOut,
+          storageDays: storageDays,
+        },
+      },
+      { new: true }
+    );
+  });
+
+  await Promise.all(updatePromises);
+
+  const response = ApiResponse.success(
+    `Gate out date assigned to ${shipments.length} shipment(s)`,
+    {
+      updatedCount: shipments.length,
+      gateOutDate: gateOut,
+    }
   );
 
   res.status(response.statusCode).json(response);

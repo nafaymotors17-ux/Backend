@@ -30,30 +30,20 @@ const shipmentSchema = new Schema(
     },
     gateInDate: { type: Date, required: true, index: true },
     gateOutDate: { type: Date, index: true },
-    vesselName: {
-      type: String,
-      trim: true,
-      uppercase: true,
+    // Vessel reference - use vessel entity
+    vesselId: {
+      type: Schema.Types.ObjectId,
+      ref: "Vessel",
       index: true,
     },
     yard: { type: String, trim: true, index: true },
-    pod: { type: String, trim: true, uppercase: true },
     // glNumber: {
     //   type: String,
     //   trim: true,
     //   uppercase: true,
 
     // },
-    jobNumber: {
-      type: String,
-      trim: true,
-      uppercase: true,
-      index: true,
-    },
-    // jobNumber: {
-    //   type: String,
-    //   trim: true,
-    // },
+
     storageDays: { type: Number, default: 0 },
     exportStatus: {
       type: String,

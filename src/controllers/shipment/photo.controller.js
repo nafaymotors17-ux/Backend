@@ -10,7 +10,6 @@ const archiver = require("archiver");
 const mongoose = require("mongoose");
 
 const Shipment = require("../../models/shipment.model");
-const { clearShipmentCache } = require("../cache");
 
 const { s3, BUCKET } = require("../../aws/s3Config");
 /**
@@ -192,7 +191,6 @@ exports.confirmPhotoUpload = async (req, res) => {
     shipment.carId.images = updatedImages;
     await shipment.save();
 
-    clearShipmentCache();
     res.json({
       message: "Car photos updated successfully",
       shipment,
@@ -252,7 +250,6 @@ exports.deleteCarPhotos = async (req, res) => {
       (img) => !photos.includes(img._id?.toString())
     );
     await shipment.save();
-    clearShipmentCache();
 
     res.json({
       message: "Selected photos deleted successfully",

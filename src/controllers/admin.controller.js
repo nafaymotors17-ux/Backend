@@ -1,24 +1,10 @@
 const bcrypt = require("bcryptjs");
-const crypto = require("crypto");
 const mongoose = require("mongoose");
 const User = require("../models/user.model");
 const ApiError = require("../utils/api.error");
 const ApiResponse = require("../utils/api.response");
 const asyncHandler = require("../utils/asyncHandler");
 const Shipments = require("../models/shipment.model");
-const {
-  get,
-  set,
-  del,
-  keys,
-  delByPrefix,
-  clearUserCache,
-  clearShipmentCache,
-} = require("./cache");
-
-// --- Helper: hash filter object for stable cache keys ---
-const filterHash = (filters) =>
-  crypto.createHash("md5").update(JSON.stringify(filters)).digest("hex");
 
 exports.listUsers = asyncHandler(async (req, res) => {
   const {
@@ -48,22 +34,6 @@ exports.listUsers = asyncHandler(async (req, res) => {
   const safeSortBy = allowedSortFields.includes(sortBy) ? sortBy : "createdAt";
   const sortOptions = { [safeSortBy]: sortOrder === "desc" ? -1 : 1 };
 
-  // --- Cache keys ---
-  const filterSignature =
-    Object.keys(filter).length > 0 ? filterHash(filter) : "nofilter";
-  const sortSignature = `${safeSortBy}_${sortOrder}`;
-  const cacheKeyPrefix = `users_${filterSignature}_${sortSignature}_limit${limitNum}`;
-  const cacheKey = `${cacheKeyPrefix}_page${pageNum}`;
-
-  // --- Serve from cache ---
-  const cached = get(cacheKey);
-  if (cached) {
-    console.log(`✅ Cache hit for ${cacheKey}`);
-    return res.status(200).json(cached);
-  }
-
-  console.log(`🚀 Cache miss for ${cacheKey} → fetching from DB...`);
-
   // --- Fetch from DB ---
   const totalUserCount = await User.countDocuments();
   const result = await User.paginate(filter, {
@@ -87,54 +57,7 @@ exports.listUsers = asyncHandler(async (req, res) => {
     }
   );
 
-  // --- Cache current page ---
-  set(cacheKey, response);
-  res
-    .set("Cache-Control", "s-maxage=60, stale-while-revalidate")
-    .status(200)
-    .json(response);
-
-  // --- Prefetch neighbor pages in background ---
-  [pageNum - 1, pageNum + 1].forEach(async (p) => {
-    if (p > 0 && p <= result.totalPages && !get(`${cacheKeyPrefix}_${p}`)) {
-      try {
-        const neighbor = await User.paginate(filter, {
-          page: p,
-          limit: limitNum,
-          sort: sortOptions,
-          select: "-refreshToken -updatedAt -__v",
-        });
-        const neighborResponse = ApiResponse.paginated(
-          "Prefetched users",
-          neighbor.docs,
-          {
-            currentPage: neighbor.page,
-            totalPages: neighbor.totalPages,
-            totalUsers: neighbor.totalDocs,
-            usersPerPage: neighbor.limit,
-            hasNextPage: neighbor.hasNextPage,
-            hasPrevPage: neighbor.hasPrevPage,
-          }
-        );
-        set(`${cacheKeyPrefix}_${p}`, neighborResponse);
-        console.log(`⚙️ Prefetched page ${p}`);
-      } catch (err) {
-        console.error(`⚠️ Prefetch failed for page ${p}:`, err.message);
-      }
-    }
-  });
-
-  // --- Maintain sliding window: keep only [current-1, current, current+1] ---
-  const allKeys = keys().filter((k) => k.startsWith(cacheKeyPrefix));
-  const keepPages = [pageNum - 1, pageNum, pageNum + 1];
-  allKeys.forEach((k) => {
-    const match = k.match(/_(\d+)$/);
-    const p = match ? parseInt(match[1]) : null;
-    if (p && !keepPages.includes(p)) {
-      del(k);
-      console.log(`🗑️ Removed stale cache ${k}`);
-    }
-  });
+  res.status(200).json(response);
 });
 exports.createUser = asyncHandler(async (req, res) => {
   const { name, username: userId, password } = req.body;
@@ -197,9 +120,7 @@ exports.createUser = asyncHandler(async (req, res) => {
       : null,
   };
 
-  // --- 6️⃣ Clear cache and send success ---
-  clearUserCache();
-
+  // --- 6️⃣ Send success ---
   const response = ApiResponse.created(
     "User created successfully",
     userResponse
@@ -274,11 +195,7 @@ exports.updateUser = asyncHandler(async (req, res) => {
     );
   }
 
-  // === 5️⃣ Clear cache (if used)
-
-  clearShipmentCache();
-  clearUserCache();
-  // === ✅ Respond
+  // === 5️⃣ Respond
   return res
     .status(200)
     .json(ApiResponse.success("User updated successfully", updatedUser));
@@ -308,8 +225,6 @@ exports.deleteUser = async (req, res) => {
     _id: user._id,
     totalShipmentsDeleted: shipments.deletedCount,
   });
-  clearShipmentCache();
-  clearUserCache();
   res.status(response.statusCode).json(response);
 };
 

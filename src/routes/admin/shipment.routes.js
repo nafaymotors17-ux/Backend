@@ -44,5 +44,7 @@ router.post("/delete", jwtMiddleware, shipmentController.deleteShipments);
 router.get("/list", shipmentController.listShipments);
 router.get("/:id", jwtMiddleware, shipmentController.getShipmentById);
 router.get("/export/csv", shipmentController.exportShipmentsExcel);
+router.post("/bulk/assign-vessel", jwtMiddleware, shipmentController.bulkAssignVessel);
+router.post("/bulk/assign-gateout", jwtMiddleware, shipmentController.bulkAssignGateOutDate);
 
 module.exports = router;

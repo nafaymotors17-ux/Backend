@@ -1,4 +1,5 @@
 const Shipment = require("../models/shipment.model");
+const Vessel = require("../models/vessel.model");
 const ApiError = require("../utils/api.error");
 const ApiResponse = require("../utils/api.response");
 const asyncHandler = require("../utils/asyncHandler");
@@ -56,13 +57,8 @@ exports.getMyShipments = async (req, res) => {
             ]
           : [{ chassisNumber: regexSearch }]),
 
-        // Vessel name search
-        { vesselName: regexSearch },
-
         // Car make/model search (assuming carId is populated)
         { "carId.makeModel": regexSearch },
-
-        { pod: regexSearch },
       ];
     }
     // Remove the else if chassisNo block - it's handled above
@@ -93,7 +89,7 @@ exports.getMyShipments = async (req, res) => {
     const allowedSortFields = [
       "gateInDate",
       "gateOutDate",
-      "vesselName",
+      "vessel.vesselName", // Vessel entity
       "yard",
       "createdAt",
       // Note: shippedDate and eta don't exist in model, removed
@@ -101,7 +97,9 @@ exports.getMyShipments = async (req, res) => {
     const sortField = allowedSortFields.includes(sortBy)
       ? sortBy
       : "gateInDate";
-    const sortOptions = { [sortField]: sortOrder === "desc" ? -1 : 1 };
+    
+    // Check if we need vessel lookup for sorting
+    const needsVesselLookupForSort = sortField === "vessel.vesselName";
 
     console.log(
       `🚀 Fetching shipments page=${pageNum}, limit=${limitNum}, ` +
@@ -120,50 +118,95 @@ exports.getMyShipments = async (req, res) => {
     const pipeline = [
       // Stage 1: Match documents (filtering)
       { $match: filter },
-
-      // Stage 2: Sort documents
-      { $sort: sortOptions },
-
-      // Stage 3: Project only needed fields and get only thumbnail (first image)
-      {
-        $project: {
-          // Include all shipment fields
-          clientId: 1,
-          gateInDate: 1,
-          gateOutDate: 1,
-          vesselName: 1,
-          yard: 1,
-          pod: 1,
-          jobNumber: 1,
-          storageDays: 1,
-          exportStatus: 1,
-          chassisNumber: 1,
-          chassisNumberReversed: 1,
-          remarks: 1,
-          createdAt: 1,
-          updatedAt: 1,
-          // Format carId with only thumbnail (first image) for list view
-          carId: {
-            makeModel: "$carId.makeModel",
-            chassisNumber: "$carId.chassisNumber",
-            // Only get first image as thumbnail for list view
-            thumbnail: {
-              $cond: {
-                if: { $gt: [{ $size: { $ifNull: ["$carId.images", []] } }, 0] },
-                then: {
-                  _id: { $arrayElemAt: ["$carId.images._id", 0] },
-                  url: { $arrayElemAt: ["$carId.images.url", 0] },
-                  alt: { $arrayElemAt: ["$carId.images.alt", 0] },
-                },
-                else: null,
-              },
-            },
-            // Include image count for UI display
-            imageCount: { $size: { $ifNull: ["$carId.images", []] } },
-          },
-        },
-      },
     ];
+
+    // Stage 2: Lookup vessel if needed for sorting or always for data
+    pipeline.push({
+      $lookup: {
+        from: "vessels",
+        localField: "vesselId",
+        foreignField: "_id",
+        as: "vessel",
+      },
+    });
+    pipeline.push({
+      $unwind: {
+        path: "$vessel",
+        preserveNullAndEmptyArrays: true,
+      },
+    });
+
+    // Stage 3: Sort documents
+    if (needsVesselLookupForSort) {
+      pipeline.push({
+        $addFields: {
+          sortVesselName: "$vessel.vesselName",
+        },
+      });
+      pipeline.push({
+        $sort: {
+          sortVesselName: sortOrder === "desc" ? -1 : 1,
+          createdAt: -1,
+        },
+      });
+    } else {
+      pipeline.push({
+        $sort: {
+          [sortField]: sortOrder === "desc" ? -1 : 1,
+          createdAt: -1,
+        },
+      });
+    }
+
+    // Stage 4: Project only needed fields and get only thumbnail (first image)
+    pipeline.push({
+      $project: {
+        // Include all shipment fields
+        clientId: 1,
+        gateInDate: 1,
+        gateOutDate: 1,
+        vesselId: 1,
+        yard: 1,
+        jobNumber: 1,
+        storageDays: 1,
+        exportStatus: 1,
+        chassisNumber: 1,
+        chassisNumberReversed: 1,
+        remarks: 1,
+        createdAt: 1,
+        updatedAt: 1,
+        // Format carId with only thumbnail (first image) for list view
+        carId: {
+          makeModel: "$carId.makeModel",
+          chassisNumber: "$carId.chassisNumber",
+          // Only get first image as thumbnail for list view
+          thumbnail: {
+            $cond: {
+              if: { $gt: [{ $size: { $ifNull: ["$carId.images", []] } }, 0] },
+              then: {
+                _id: { $arrayElemAt: ["$carId.images._id", 0] },
+                url: { $arrayElemAt: ["$carId.images.url", 0] },
+                alt: { $arrayElemAt: ["$carId.images.alt", 0] },
+              },
+              else: null,
+            },
+          },
+          // Include image count for UI display
+          imageCount: { $size: { $ifNull: ["$carId.images", []] } },
+        },
+        // Vessel fields from entity
+        vessel: {
+          _id: "$vessel._id",
+          vesselName: "$vessel.vesselName",
+          jobNumber: "$vessel.jobNumber",
+          etd: "$vessel.etd",
+          shippingLine: "$vessel.shippingLine",
+          pod: "$vessel.pod",
+        },
+        // Remove sort field if it exists
+        ...(needsVesselLookupForSort ? { sortVesselName: "$$REMOVE" } : {}),
+      },
+    });
 
     // --- Use aggregatePaginate for better performance ---
     const result = await Shipment.aggregatePaginate(
@@ -227,31 +270,81 @@ exports.getMyShipmentById = async (req, res) => {
     throw ApiError.badRequest("Invalid shipment ID format");
   }
 
-  // OPTIMIZED: Use findById() instead of findOne() - specifically optimized for _id lookups
-  // Then filter by clientId using where() - still uses compound index efficiently
-  // lean() returns plain JavaScript object (no Mongoose overhead)
-  // Compound index { _id: 1, clientId: 1 } makes this query very fast
-  const shipment = await Shipment.findById(id)
-    .where("clientId")
-    .equals(customerId)
-    .lean();
+  // Use aggregation to include vessel data
+  const pipeline = [
+    {
+      $match: {
+        _id: new mongoose.Types.ObjectId(id),
+        clientId: customerId,
+      },
+    },
+    {
+      $lookup: {
+        from: "vessels",
+        localField: "vesselId",
+        foreignField: "_id",
+        as: "vessel",
+      },
+    },
+    {
+      $unwind: {
+        path: "$vessel",
+        preserveNullAndEmptyArrays: true,
+      },
+    },
+    {
+      $project: {
+        clientId: 1,
+        gateInDate: 1,
+        gateOutDate: 1,
+        vesselId: 1,
+        yard: 1,
+        jobNumber: 1,
+        storageDays: 1,
+        exportStatus: 1,
+        chassisNumber: 1,
+        chassisNumberReversed: 1,
+        remarks: 1,
+        createdAt: 1,
+        updatedAt: 1,
+        carId: {
+          makeModel: "$carId.makeModel",
+          chassisNumber: "$carId.chassisNumber",
+          images: {
+            $map: {
+              input: { $ifNull: ["$carId.images", []] },
+              as: "img",
+              in: {
+                _id: "$$img._id",
+                url: "$$img.url",
+                alt: { $ifNull: ["$$img.alt", "Car photo"] },
+                key: "$$img.key",
+                name: "$$img.name",
+              },
+            },
+          },
+        },
+        vessel: {
+          _id: "$vessel._id",
+          vesselName: "$vessel.vesselName",
+          jobNumber: "$vessel.jobNumber",
+          etd: "$vessel.etd",
+          shippingLine: "$vessel.shippingLine",
+          pod: "$vessel.pod",
+        },
+      },
+    },
+  ];
 
-  if (!shipment) {
+  const result = await Shipment.aggregate(pipeline);
+
+  if (!result || result.length === 0) {
     throw ApiError.notFound(
       "Shipment not found or you don't have access to this shipment"
     );
   }
 
-  // Format images array to ensure consistent structure
-  if (shipment.carId?.images) {
-    shipment.carId.images = shipment.carId.images.map((img) => ({
-      _id: img._id,
-      url: img.url,
-      alt: img.alt || "Car photo",
-      key: img.key,
-      name: img.name,
-    }));
-  }
+  const shipment = result[0];
 
   const response = ApiResponse.success(
     "Shipment retrieved successfully",
@@ -290,16 +383,64 @@ exports.getShipmentOverview = async (req, res) => {
     statusOverview[item._id] = item.count;
   });
 
-  // Get recent shipments (last 5)
-  const recentShipments = await Shipment.find({ clientId: customerId })
-    .sort({ gateInDate: -1 })
-    .limit(5)
-    .select("vesselName yard gateInDate exportStatus carId");
+  // Get recent shipments (last 5) with vessel data
+  const recentShipmentsPipeline = [
+    { $match: { clientId: customerId } },
+    {
+      $lookup: {
+        from: "vessels",
+        localField: "vesselId",
+        foreignField: "_id",
+        as: "vessel",
+      },
+    },
+    {
+      $unwind: {
+        path: "$vessel",
+        preserveNullAndEmptyArrays: true,
+      },
+    },
+    {
+      $project: {
+        vesselId: 1,
+        yard: 1,
+        gateInDate: 1,
+        exportStatus: 1,
+        "carId.makeModel": 1,
+        vessel: {
+          _id: "$vessel._id",
+          vesselName: "$vessel.vesselName",
+        },
+      },
+    },
+    { $sort: { gateInDate: -1 } },
+    { $limit: 5 },
+  ];
+  const recentShipments = await Shipment.aggregate(recentShipmentsPipeline);
 
-  // Get shipments by vessel (top 5)
+  // Get shipments by vessel (top 5) - using vessel entity
   const vesselStats = await Shipment.aggregate([
     { $match: { clientId: customerId } },
-    { $group: { _id: "$vesselName", count: { $sum: 1 } } },
+    {
+      $lookup: {
+        from: "vessels",
+        localField: "vesselId",
+        foreignField: "_id",
+        as: "vessel",
+      },
+    },
+    {
+      $unwind: {
+        path: "$vessel",
+        preserveNullAndEmptyArrays: true,
+      },
+    },
+    {
+      $group: {
+        _id: "$vessel.vesselName",
+        count: { $sum: 1 },
+      },
+    },
     { $sort: { count: -1 } },
     { $limit: 5 },
   ]);
@@ -368,12 +509,8 @@ exports.exportMyShipmentsExcel = asyncHandler(async (req, res) => {
           ]
         : [{ chassisNumber: regexSearch }]),
 
-      // Vessel name search
-      { vesselName: regexSearch },
-
       // Car make/model search - FIXED: carId is embedded object
       { "carId.makeModel": regexSearch },
-      { pod: regexSearch },
     ];
   }
 
@@ -453,23 +590,41 @@ exports.exportMyShipmentsExcel = asyncHandler(async (req, res) => {
 
     sheet.views = [{ state: "frozen", ySplit: 1 }];
     const sortOptions = { gateInDate: 1 };
-    // ✅ Use SAME query logic as getMyShipments
-    const cursor = Shipment.find(filter)
-      .select({
-        gateInDate: 1,
-        gateOutDate: 1,
-        vesselName: 1,
-        yard: 1,
-        chassisNumber: 1,
-        pod: 1,
-        exportStatus: 1,
-        storageDays: 1,
-        "carId.makeModel": 1,
-        "carId.images": 1,
-      })
-      .sort(sortOptions)
-      .lean() // Add lean for consistency
-      .cursor({ batchSize: 500 });
+    // ✅ Use aggregation with vessel lookup for export
+    const pipeline = [
+      { $match: filter },
+      {
+        $lookup: {
+          from: "vessels",
+          localField: "vesselId",
+          foreignField: "_id",
+          as: "vessel",
+        },
+      },
+      {
+        $unwind: {
+          path: "$vessel",
+          preserveNullAndEmptyArrays: true,
+        },
+      },
+      {
+        $project: {
+          gateInDate: 1,
+          gateOutDate: 1,
+          yard: 1,
+          chassisNumber: 1,
+          exportStatus: 1,
+          storageDays: 1,
+          "carId.makeModel": 1,
+          "carId.images": 1,
+          vesselName: "$vessel.vesselName",
+          pod: "$vessel.pod",
+        },
+      },
+      { $sort: sortOptions },
+    ];
+
+    const cursor = Shipment.aggregate(pipeline).cursor({ batchSize: 500 });
 
     let total = 0;
     for await (const s of cursor) {

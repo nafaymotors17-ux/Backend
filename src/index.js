@@ -21,6 +21,8 @@ const authRoutes = require("./routes/auth.routes");
 const adminShipmentRoutes = require("./routes/admin/shipment.routes");
 const adminRoutes = require("./routes/admin/admin.route");
 const clientRoutes = require("./routes/client.routes");
+const vesselRoutes = require("./routes/admin/vessel.routes");
+const migrationRoutes = require("./routes/admin/migration.routes");
 
 const photoRoutes = require("./routes/photo.routes");
 // Middleware
@@ -69,6 +71,8 @@ app.get("/api/debug/db", async (req, res) => {
 app.use("/api/auth", authRoutes);
 app.use("/api/admin", adminRoutes);
 app.use("/api/admin/shipments", adminShipmentRoutes);
+app.use("/api/admin/vessels", vesselRoutes);
+app.use("/api/admin/migration", migrationRoutes);
 app.use("/api/photos", photoRoutes);
 app.use("/api/client", clientRoutes);
 
