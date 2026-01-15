@@ -86,8 +86,8 @@ app.get("/api/health", (req, res) => {
   });
 });
 
-// Root route
-app.use("/", (req, res) => {
+// Root route (must be last)
+app.get("/", (req, res) => {
   res.send("<h1>This is Yokohama Inventory Management Server Running</h1>");
 });
 

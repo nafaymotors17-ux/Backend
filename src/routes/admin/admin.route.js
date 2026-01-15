@@ -22,6 +22,11 @@ router.delete(
   jwtMiddleware,
   asyncHandler(adminController.deleteUser)
 );
+router.patch(
+  "/toggle-mass-download/:id",
+  jwtMiddleware,
+  asyncHandler(adminController.toggleMassDownloadPermission)
+);
 router.get("/stats/dashboard", statsController.getStats);
 router.get("/stats/gates", statsController.getGateStats);
 

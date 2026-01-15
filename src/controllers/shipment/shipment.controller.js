@@ -4,6 +4,7 @@ const ApiResponse = require("../../utils/api.response");
 const asyncHandler = require("../../utils/asyncHandler");
 const mongoose = require("mongoose");
 const Vessel = require("../../models/vessel.model.js");
+const { getCloudFrontUrl, addImageUrls } = require("../../utils/cloudfront");
 // const triggerDeletePhotos = require("../../aws/lambda/deleteCarPhotos");
 const escapeRegex = (str = "") => str.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"); // safe regex escape
 const { calculateStoragePeriod } = require("../../utils/storage.days.calc.js");
@@ -496,8 +497,8 @@ exports.updateShipment = asyncHandler(async (req, res) => {
 
   // Apply sanitization: "" -> undefined
   const sanitizedBody = sanitizeInput(originalBody);
-  console.log("Orignal body : ", originalBody);
-  console.log("Sanitized body : ", sanitizedBody);
+  // console.log("Orignal body : ", originalBody);
+  // console.log("Sanitized body : ", sanitizedBody);
 
   try {
     const { id } = req.params;
@@ -1080,20 +1081,25 @@ exports.exportShipmentsExcel = asyncHandler(async (req, res) => {
 
     // Columns & freeze
     sheet.columns = [
-      { width: 14 },
-      { width: 14 },
-      { width: 20 },
-      { width: 25 },
-      { width: 12 },
-      { width: 22 },
-      { width: 10 },
-      { width: 18 },
-      { width: 12 },
-      { width: 12 },
-      { width: 14 },
-      { width: 14 },
-      { width: 12 },
-      { width: 30 },
+      { width: 14 }, // Yard In Date
+      { width: 14 }, // Yard Out Date
+      // { width: 24 }, // Vessel ID
+      { width: 20 }, // Vessel Name
+      { width: 12 }, // ETD
+      { width: 12 }, // Job #
+      { width: 10 }, // POD
+      { width: 18 }, // Shipping Line
+      // { width: 20 }, // Vessel Created At
+      // { width: 20 }, // Vessel Updated At
+      { width: 25 }, // Customer
+      { width: 12 }, // User ID
+      { width: 25 }, // Make/Model
+      { width: 22 }, // Chassis
+      { width: 12 }, // Yard
+      { width: 18 }, // Status
+      { width: 12 }, // Storage Days
+      { width: 12 }, // Total Images
+      { width: 30 }, // Remarks
     ];
     sheet.views = [{ state: "frozen", ySplit: 4 }];
 
@@ -1126,14 +1132,19 @@ exports.exportShipmentsExcel = asyncHandler(async (req, res) => {
     const headerRow = sheet.addRow([
       "Yard In Date",
       "Yard Out Date",
-      "Vessel",
-      "Company",
+      // "Vessel ID",
+      "Vessel Name",
+      "ETD",
+      "Job #",
+      "POD",
+      "Shipping Line",
+      // "Vessel Created At",
+      // "Vessel Updated At",
+      "Customer",
       "User ID",
       "Make/Model",
       "Chassis",
       "Yard",
-      "Job #",
-      "POD",
       "Status",
       "Storage Days",
       "Total Images",
@@ -1186,10 +1197,15 @@ exports.exportShipmentsExcel = asyncHandler(async (req, res) => {
         $project: {
           gateInDate: 1,
           gateOutDate: 1,
+          // vesselId: "$vessel._id",
           vesselName: "$vessel.vesselName",
-          yard: 1,
+          etd: "$vessel.etd",
           jobNumber: "$vessel.jobNumber",
           pod: "$vessel.pod",
+          shippingLine: "$vessel.shippingLine",
+          //vesselCreatedAt: "$vessel.createdAt",
+          //vesselUpdatedAt: "$vessel.updatedAt",
+          yard: 1,
           exportStatus: 1,
           storageDays: 1,
           clientName: "$client.name",
@@ -1203,7 +1219,7 @@ exports.exportShipmentsExcel = asyncHandler(async (req, res) => {
     ];
 
     const cursor = Shipment.aggregate(exportPipeline).cursor({
-      batchSize: 500,
+      batchSize: 1000,
     });
 
     let total = 0;
@@ -1211,14 +1227,19 @@ exports.exportShipmentsExcel = asyncHandler(async (req, res) => {
       const row = sheet.addRow([
         s.gateInDate ? s.gateInDate.toISOString().split("T")[0] : "",
         s.gateOutDate ? s.gateOutDate.toISOString().split("T")[0] : "",
+        // s.vesselId ? s.vesselId.toString() : "",
         s.vesselName || "",
+        s.etd ? s.etd.toISOString().split("T")[0] : "",
+        s.jobNumber || "",
+        s.pod || "",
+        s.shippingLine || "",
+        // s.vesselCreatedAt ? s.vesselCreatedAt.toISOString() : "",
+        // s.vesselUpdatedAt ? s.vesselUpdatedAt.toISOString() : "",
         s.clientName || "",
         s.clientUserId || "",
         s.carMakeModel || "",
         s.carChassisNumber || "",
         s.yard || "",
-        s.jobNumber || "",
-        s.pod || "",
         s.exportStatus || "",
         s.storageDays || "",
         s.totalImages || 0,
@@ -1242,7 +1263,13 @@ exports.exportShipmentsExcel = asyncHandler(async (req, res) => {
       "",
       "",
       "",
+      "",
+      "",
+      "",
+      "",
+      "",
       `Total: ${total} records`,
+      "",
     ]);
     summaryRow.font = { bold: true };
     summaryRow.commit();
@@ -1383,10 +1410,10 @@ exports.getShipmentById = asyncHandler(async (req, res) => {
               as: "img",
               in: {
                 _id: "$$img._id",
-                url: "$$img.url",
-                alt: { $ifNull: ["$$img.alt", "Car photo"] },
                 key: "$$img.key",
+                alt: { $ifNull: ["$$img.alt", "Car photo"] },
                 name: "$$img.name",
+                // url will be constructed from key in post-processing
               },
             },
           },
@@ -1458,6 +1485,15 @@ exports.getShipmentById = asyncHandler(async (req, res) => {
   }
 
   const shipment = result[0];
+
+  // Add CloudFront URLs to images (constructed from keys, not stored URLs)
+  if (shipment.carId?.images) {
+    shipment.carId.images = addImageUrls(shipment.carId.images);
+  }
+  // Add ZIP file URL if available
+  if (shipment.carId?.zipFileKey) {
+    shipment.carId.zipFileUrl = getCloudFrontUrl(shipment.carId.zipFileKey);
+  }
 
   const response = ApiResponse.success(
     "Shipment retrieved successfully",

@@ -4,6 +4,7 @@ const ApiError = require("../utils/api.error");
 const ApiResponse = require("../utils/api.response");
 const asyncHandler = require("../utils/asyncHandler");
 const mongoose = require("mongoose");
+const { getCloudFrontUrl } = require("../utils/cloudfront");
 // --- Utility: escape regex safely ---
 const escapeRegex = (str) => str.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
@@ -97,7 +98,7 @@ exports.getMyShipments = async (req, res) => {
     const sortField = allowedSortFields.includes(sortBy)
       ? sortBy
       : "gateInDate";
-    
+
     // Check if we need vessel lookup for sorting
     const needsVesselLookupForSort = sortField === "vessel.vesselName";
 
@@ -185,8 +186,9 @@ exports.getMyShipments = async (req, res) => {
               if: { $gt: [{ $size: { $ifNull: ["$carId.images", []] } }, 0] },
               then: {
                 _id: { $arrayElemAt: ["$carId.images._id", 0] },
-                url: { $arrayElemAt: ["$carId.images.url", 0] },
+                key: { $arrayElemAt: ["$carId.images.key", 0] },
                 alt: { $arrayElemAt: ["$carId.images.alt", 0] },
+                // url will be added in post-processing
               },
               else: null,
             },
@@ -196,9 +198,7 @@ exports.getMyShipments = async (req, res) => {
         },
         // Vessel fields from entity
         vessel: {
-          _id: "$vessel._id",
           vesselName: "$vessel.vesselName",
-          jobNumber: "$vessel.jobNumber",
           etd: "$vessel.etd",
           shippingLine: "$vessel.shippingLine",
           pod: "$vessel.pod",
@@ -218,7 +218,17 @@ exports.getMyShipments = async (req, res) => {
     );
 
     // --- Prepare response ---
-    const data = result.docs;
+    const data = result.docs.map((doc) => {
+      // Add CloudFront URL to thumbnail if it exists
+      if (doc.carId?.thumbnail?.key) {
+        doc.carId.thumbnail.url = getCloudFrontUrl(doc.carId.thumbnail.key);
+      } else if (doc.carId?.imageCount > 0 && !doc.carId?.thumbnail) {
+        // If no thumbnail but images exist, we need to fetch first image key
+        // This is handled in the aggregation pipeline, but ensure URL is set
+        // The frontend will use images[0].url as fallback
+      }
+      return doc;
+    });
 
     const response = {
       status: "success",
@@ -316,13 +326,16 @@ exports.getMyShipmentById = async (req, res) => {
               as: "img",
               in: {
                 _id: "$$img._id",
-                url: "$$img.url",
-                alt: { $ifNull: ["$$img.alt", "Car photo"] },
                 key: "$$img.key",
+                alt: { $ifNull: ["$$img.alt", "Car photo"] },
                 name: "$$img.name",
+                // url will be added in post-processing
               },
             },
           },
+          // Include ZIP file info if available
+          zipFileKey: "$carId.zipFileKey",
+          zipFileSize: "$carId.zipFileSize",
         },
         vessel: {
           _id: "$vessel._id",
@@ -344,7 +357,18 @@ exports.getMyShipmentById = async (req, res) => {
     );
   }
 
+  // Add CloudFront URLs to images
   const shipment = result[0];
+  if (shipment.carId?.images) {
+    shipment.carId.images = shipment.carId.images.map((img) => ({
+      ...img,
+      url: getCloudFrontUrl(img.key),
+    }));
+  }
+  // Add ZIP file URL if available
+  if (shipment.carId?.zipFileKey) {
+    shipment.carId.zipFileUrl = getCloudFrontUrl(shipment.carId.zipFileKey);
+  }
 
   const response = ApiResponse.success(
     "Shipment retrieved successfully",
@@ -574,11 +598,13 @@ exports.exportMyShipmentsExcel = asyncHandler(async (req, res) => {
 
     const sheet = workbook.addWorksheet("My Shipments");
 
-    // Columns
+    // Columns - Added ETD and Shipping Line
     sheet.columns = [
       { header: "Gate In Date", key: "gateInDate", width: 14 },
       { header: "Gate Out Date", key: "gateOutDate", width: 14 },
       { header: "Vessel", key: "vesselName", width: 20 },
+      { header: "ETD", key: "etd", width: 14 },
+      { header: "Shipping Line", key: "shippingLine", width: 18 },
       { header: "Make/Model", key: "makeModel", width: 25 },
       { header: "Yard", key: "yard", width: 12 },
       { header: "Chassis No", key: "chassisNumber", width: 22 },
@@ -618,6 +644,8 @@ exports.exportMyShipmentsExcel = asyncHandler(async (req, res) => {
           "carId.makeModel": 1,
           "carId.images": 1,
           vesselName: "$vessel.vesselName",
+          etd: "$vessel.etd",
+          shippingLine: "$vessel.shippingLine",
           pod: "$vessel.pod",
         },
       },
@@ -637,6 +665,8 @@ exports.exportMyShipmentsExcel = asyncHandler(async (req, res) => {
           s.gateInDate ? s.gateInDate.toISOString().split("T")[0] : "",
           s.gateOutDate ? s.gateOutDate.toISOString().split("T")[0] : "",
           s.vesselName || "",
+          s.etd ? s.etd.toISOString().split("T")[0] : "",
+          s.shippingLine || "",
           makeModel,
           s.yard || "",
           s.chassisNumber || "",

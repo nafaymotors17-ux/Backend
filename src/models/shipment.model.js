@@ -21,12 +21,17 @@ const shipmentSchema = new Schema(
       },
       images: [
         {
-          key: { type: String, required: true }, // e.g. "car_photos/ABC123/1.jpg"
-          url: { type: String, required: true }, // full S3 URL
+          key: { type: String, required: true }, // e.g. "cars/{shipmentId}/1.jpg"
+          url: { type: String }, // Optional - kept for backward compatibility, but CloudFront URL constructed from key
           name: { type: String }, // optional (e.g. "1.jpg")
           alt: { type: String, default: "Car photo" },
         },
       ],
+      // Optional ZIP file for cost-effective photo storage
+      // Stored in same folder as photos: cars/{shipmentId}/{chassis}.zip
+      zipFileKey: { type: String }, // S3 key for ZIP file (e.g. "cars/{shipmentId}/{chassis}.zip")
+      zipFileSize: { type: Number }, // Size in bytes (max 2MB)
+      // URL constructed from zipFileKey using CloudFront - not stored in DB
     },
     gateInDate: { type: Date, required: true, index: true },
     gateOutDate: { type: Date, index: true },

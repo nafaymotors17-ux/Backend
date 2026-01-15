@@ -48,6 +48,7 @@ exports.login = asyncHandler(async (req, res) => {
     role: user.role,
     _id: user._id,
     createdAt: user.createdAt,
+    canMassDownloadPhotos: user.canMassDownloadPhotos || false,
   };
   const response = ApiResponse.success("Login successful", {
     accessToken,

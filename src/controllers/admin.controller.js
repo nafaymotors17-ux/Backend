@@ -219,7 +219,7 @@ exports.deleteUser = async (req, res) => {
   const shipments = await Shipments.deleteMany({ clientId: user._id });
 
   if (shipments.deletedCount <= 0) {
-    console.log("No shipments for : ", user.userId);
+    // console.log("No shipments for : ", user.userId);
   }
   const response = ApiResponse.success("User deleted successfully", {
     _id: user._id,
@@ -244,3 +244,44 @@ exports.getUserById = async (req, res) => {
 
   res.status(response.statusCode).json(response);
 };
+
+/**
+ * Toggle mass download photos permission for a customer
+ */
+exports.toggleMassDownloadPermission = asyncHandler(async (req, res) => {
+  const { id } = req.params;
+  const { canMassDownloadPhotos } = req.body;
+
+  if (typeof canMassDownloadPhotos !== "boolean") {
+    throw ApiError.badRequest("canMassDownloadPhotos must be a boolean value");
+  }
+
+  const user = await User.findById(id);
+  if (!user) {
+    throw ApiError.notFound("User not found");
+  }
+
+  // Only allow for customers
+  if (user.role !== "customer") {
+    throw ApiError.badRequest(
+      "Mass download permission can only be set for customers"
+    );
+  }
+
+  user.canMassDownloadPhotos = canMassDownloadPhotos;
+  await user.save();
+
+  const response = ApiResponse.success(
+    `Mass download permission ${
+      canMassDownloadPhotos ? "enabled" : "disabled"
+    } successfully`,
+    {
+      _id: user._id,
+      userId: user.userId,
+      name: user.name,
+      canMassDownloadPhotos: user.canMassDownloadPhotos,
+    }
+  );
+
+  res.status(response.statusCode).json(response);
+});

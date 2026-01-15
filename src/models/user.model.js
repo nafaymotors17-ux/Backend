@@ -27,6 +27,10 @@ const userSchema = new mongoose.Schema(
       enum: ["admin", "customer", "subadmin"],
       default: "customer",
     },
+    canMassDownloadPhotos: {
+      type: Boolean,
+      default: false,
+    },
     refreshToken: { type: String, default: null },
   },
   { timestamps: true }
