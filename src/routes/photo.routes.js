@@ -11,13 +11,6 @@ router.post(
   asyncHandler(photoController.generateSignedUrls)
 );
 
-// POST: generate signed URL for ZIP file upload
-router.post(
-  "/upload-zip",
-  jwtMiddleware,
-  asyncHandler(photoController.generateZipUploadUrl)
-);
-
 // POST: confirm uploaded photos and update DB metadata
 router.post(
   "/confirm",
@@ -25,12 +18,7 @@ router.post(
   asyncHandler(photoController.confirmPhotoUpload)
 );
 
-// POST: confirm ZIP file upload and update DB
-router.post(
-  "/confirm-zip",
-  jwtMiddleware,
-  asyncHandler(photoController.confirmZipUpload)
-);
+// ZIP upload routes removed - no longer needed
 
 // GET: download photos - requires authentication
 router.get(

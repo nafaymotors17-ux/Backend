@@ -27,11 +27,7 @@ const shipmentSchema = new Schema(
           alt: { type: String, default: "Car photo" },
         },
       ],
-      // Optional ZIP file for cost-effective photo storage
-      // Stored in same folder as photos: cars/{shipmentId}/{chassis}.zip
-      zipFileKey: { type: String }, // S3 key for ZIP file (e.g. "cars/{shipmentId}/{chassis}.zip")
-      zipFileSize: { type: Number }, // Size in bytes (max 2MB)
-      // URL constructed from zipFileKey using CloudFront - not stored in DB
+      // ZIP file storage removed - ZIP creation now handled in frontend
     },
     gateInDate: { type: Date, required: true, index: true },
     gateOutDate: { type: Date, index: true },
