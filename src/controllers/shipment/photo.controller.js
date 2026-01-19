@@ -352,7 +352,9 @@ exports.deleteCarPhotos = async (req, res) => {
   }
 };
 
-// Download photos - returns signed URLs for frontend to download and create ZIP
+// Download photos - returns S3 signed URLs for frontend to download and create ZIP
+// ✅ Using S3 signed URLs for downloads (temporary access, secure)
+// ✅ CloudFront URLs are used for viewing (cached for 1 year, reduces S3 costs)
 exports.downloadCarPhotos = async (req, res) => {
   try {
     const { shipmentId } = req.query;
@@ -383,10 +385,9 @@ exports.downloadCarPhotos = async (req, res) => {
       return res.status(404).json({ message: "No photos found" });
     }
 
-    const shipmentFolderId = shipment._id.toString();
     const signedUrls = [];
 
-    // Generate signed URLs for each photo
+    // Generate S3 signed URLs for each photo (temporary access for downloads)
     for (const image of shipment.carId.images) {
       if (!image.key) continue;
 
@@ -403,7 +404,7 @@ exports.downloadCarPhotos = async (req, res) => {
 
         const fileName = image.key.split("/").pop();
         signedUrls.push({
-          url: downloadUrl,
+          url: downloadUrl, // S3 signed URL (temporary, secure)
           fileName: fileName,
           key: image.key,
         });
@@ -419,7 +420,7 @@ exports.downloadCarPhotos = async (req, res) => {
         .json({ message: "No photos available for download" });
     }
 
-    // Return signed URLs - frontend will download and create ZIP
+    // Return S3 signed URLs - frontend will download and create ZIP
     res.setHeader("Content-Type", "application/json");
     res.json({
       photos: signedUrls,
