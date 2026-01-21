@@ -37,6 +37,8 @@ router.get("/testing", async (req, res) => {
 });
 
 router.post("/create", shipmentController.createShipment);
+router.post("/bulk/validate", shipmentController.validateBulkShipments);
+router.post("/bulk/create", shipmentController.createBulkShipments);
 router.put("/update/:id", jwtMiddleware, shipmentController.updateShipment);
 router.post("/updateRemarks", jwtMiddleware, shipmentController.updateRemarks);
 router.delete("/delete/:id", jwtMiddleware, shipmentController.deleteShipment);

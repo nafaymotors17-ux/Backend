@@ -473,6 +473,321 @@ exports.createShipment = asyncHandler(async (req, res) => {
 });
 
 /**
+ * Validate bulk shipments - check chassis uniqueness
+ */
+exports.validateBulkShipments = asyncHandler(async (req, res) => {
+  try {
+    const { chassisNumbers } = req.body;
+
+    if (!Array.isArray(chassisNumbers) || chassisNumbers.length === 0) {
+      throw ApiError.badRequest("chassisNumbers array is required and must not be empty");
+    }
+
+    if (chassisNumbers.length > 100) {
+      throw ApiError.badRequest("Cannot validate more than 100 chassis numbers at once");
+    }
+
+    // Normalize chassis numbers (uppercase, trim) and track original indices
+    const normalizedChassisWithIndex = chassisNumbers.map((chassis, originalIndex) => ({
+      originalIndex: originalIndex + 1,
+      normalized: chassis ? chassis.trim().toUpperCase() : null,
+    })).filter((item) => item.normalized);
+
+    const normalizedChassis = normalizedChassisWithIndex.map((item) => item.normalized);
+
+    // Check for duplicates within the request
+    const duplicatesInRequest = [];
+    const seen = new Map(); // Map chassis -> first occurrence index
+    normalizedChassisWithIndex.forEach((item) => {
+      const { originalIndex, normalized } = item;
+      if (seen.has(normalized)) {
+        // This is a duplicate
+        duplicatesInRequest.push({
+          index: originalIndex,
+          chassisNo: normalized,
+          error: "Duplicate chassis number in request",
+        });
+        // Also mark the first occurrence if not already marked
+        const firstIndex = seen.get(normalized);
+        if (firstIndex !== originalIndex) {
+          const alreadyMarked = duplicatesInRequest.some(
+            (e) => e.index === firstIndex && e.chassisNo === normalized
+          );
+          if (!alreadyMarked) {
+            duplicatesInRequest.push({
+              index: firstIndex,
+              chassisNo: normalized,
+              error: "Duplicate chassis number in request",
+            });
+          }
+        }
+      } else {
+        seen.set(normalized, originalIndex);
+      }
+    });
+
+    // Check for existing chassis numbers in database
+    const existingShipments = await Shipment.find({
+      chassisNumber: { $in: normalizedChassis },
+    }).select("chassisNumber").lean();
+
+    const existingChassisSet = new Set(
+      existingShipments.map((s) => s.chassisNumber)
+    );
+
+    const duplicatesInDB = [];
+    normalizedChassisWithIndex.forEach((item) => {
+      const { originalIndex, normalized } = item;
+      if (existingChassisSet.has(normalized)) {
+        duplicatesInDB.push({
+          index: originalIndex,
+          chassisNo: normalized,
+          error: `Chassis number "${normalized}" already exists in database`,
+        });
+      }
+    });
+
+    const allErrors = [...duplicatesInRequest, ...duplicatesInDB];
+    const isValid = allErrors.length === 0;
+
+    return res.status(200).json({
+      success: isValid,
+      message: isValid
+        ? "All chassis numbers are unique and available"
+        : "Some chassis numbers are duplicates or already exist",
+      data: {
+        isValid,
+        errors: allErrors,
+        totalChecked: normalizedChassis.length,
+        errorCount: allErrors.length,
+      },
+    });
+  } catch (err) {
+    throw ApiError.badRequest(err.message || "Failed to validate bulk shipments");
+  }
+});
+
+/**
+ * Bulk create shipments (assumes validation already done and clientId is guaranteed)
+ */
+exports.createBulkShipments = asyncHandler(async (req, res) => {
+  try {
+    const { shipments: shipmentsData } = req.body;
+
+    if (!Array.isArray(shipmentsData) || shipmentsData.length === 0) {
+      throw ApiError.badRequest("shipments array is required and must not be empty");
+    }
+
+    if (shipmentsData.length > 100) {
+      throw ApiError.badRequest("Cannot create more than 100 shipments at once");
+    }
+
+    const results = {
+      successful: [],
+      failed: [],
+    };
+
+    // Prepare all shipment documents for bulk insert
+    const shipmentDocuments = [];
+    
+    // First pass: validate and prepare documents
+    for (let i = 0; i < shipmentsData.length; i++) {
+      const shipmentData = shipmentsData[i];
+      const {
+        customerId,
+        carName,
+        chassisNo,
+        gateInDate,
+        gateOutDate,
+        yard,
+        exportStatus = "pending",
+        remarks,
+      } = shipmentData;
+
+      // Validation (clientId is guaranteed after validation step)
+      if (!chassisNo || !gateInDate) {
+        results.failed.push({
+          index: i + 1,
+          chassisNo: chassisNo || "N/A",
+          error: "chassisNo and gateInDate are required",
+        });
+        continue;
+      }
+
+      if (!customerId || !customerId._id) {
+        results.failed.push({
+          index: i + 1,
+          chassisNo: chassisNo || "N/A",
+          error: "customerId._id is required",
+        });
+        continue;
+      }
+
+      const chassisNumber = chassisNo.trim().toUpperCase();
+      // Calculate reverse chassis (like pre-save hook does for single shipment)
+      const chassisNumberReversed = chassisNumber.split("").reverse().join("");
+      const gateIn = new Date(gateInDate);
+      const gateOut = gateOutDate ? new Date(gateOutDate) : null;
+
+      if (gateOut && gateOut < gateIn) {
+        results.failed.push({
+          index: i + 1,
+          chassisNo: chassisNumber,
+          error: "Gate out date cannot be earlier than gate in date",
+        });
+        continue;
+      }
+
+      if (!VALID_EXPORT_STATUSES.includes(exportStatus)) {
+        results.failed.push({
+          index: i + 1,
+          chassisNo: chassisNumber,
+          error: "Invalid export status",
+        });
+        continue;
+      }
+
+      // Build shipment document (matching single shipment creation pattern)
+      const newShipmentData = {
+        clientId: customerId._id,
+        carId: {
+          makeModel: carName ? carName.trim().toUpperCase() : undefined,
+          chassisNumber,
+          images: [],
+        },
+        chassisNumber,
+        chassisNumberReversed, // Add reverse chassis manually (insertMany doesn't trigger pre-save hooks)
+        gateInDate: gateIn,
+        exportStatus,
+        storageDays: gateOut ? calculateStoragePeriod(gateIn, gateOut) : 0,
+      };
+
+      if (gateOut) newShipmentData.gateOutDate = gateOut;
+      if (yard) newShipmentData.yard = yard;
+      if (remarks) newShipmentData.remarks = remarks;
+
+      shipmentDocuments.push({
+        index: i + 1,
+        chassisNo: chassisNumber,
+        data: newShipmentData,
+      });
+    }
+
+    // Filter out failed documents
+    const validDocuments = shipmentDocuments
+      .filter((doc) => {
+        // Check if this document failed validation
+        const failed = results.failed.some((f) => f.index === doc.index);
+        return !failed;
+      })
+      .map((doc) => doc.data);
+
+    // Bulk insert using insertMany
+    if (validDocuments.length > 0) {
+      try {
+        const insertedShipments = await Shipment.insertMany(validDocuments, {
+          ordered: false, // Continue inserting even if some fail
+        });
+
+        // Map successful insertions back to original indices
+        const chassisToDocMap = new Map();
+        shipmentDocuments.forEach((doc) => {
+          if (!results.failed.some((f) => f.index === doc.index)) {
+            chassisToDocMap.set(doc.data.chassisNumber, doc);
+          }
+        });
+
+        insertedShipments.forEach((shipment) => {
+          const doc = chassisToDocMap.get(shipment.chassisNumber);
+          if (doc) {
+            results.successful.push({
+              index: doc.index,
+              chassisNo: shipment.chassisNumber,
+              shipmentId: shipment._id,
+            });
+          }
+        });
+      } catch (err) {
+        // Handle bulk insert errors
+        if (err.writeErrors && err.writeErrors.length > 0) {
+          // Some documents failed, but some may have succeeded
+          const failedIndices = new Set();
+          
+          err.writeErrors.forEach((writeError) => {
+            const failedIndex = writeError.index;
+            const failedDoc = validDocuments[failedIndex];
+            const chassisNo = failedDoc?.chassisNumber || "N/A";
+            const originalDoc = shipmentDocuments.find(
+              (d) => d.data.chassisNumber === chassisNo
+            );
+            
+            if (originalDoc) {
+              failedIndices.add(originalDoc.index);
+              results.failed.push({
+                index: originalDoc.index,
+                chassisNo,
+                error: writeError.errmsg || writeError.err?.message || "Failed to create shipment",
+              });
+            }
+          });
+
+          // Add successful ones (those not in failedIndices)
+          if (err.insertedDocs && err.insertedDocs.length > 0) {
+            err.insertedDocs.forEach((insertedShipment) => {
+              const originalDoc = shipmentDocuments.find(
+                (d) => d.data.chassisNumber === insertedShipment.chassisNumber
+              );
+              if (originalDoc && !failedIndices.has(originalDoc.index)) {
+                results.successful.push({
+                  index: originalDoc.index,
+                  chassisNo: insertedShipment.chassisNumber,
+                  shipmentId: insertedShipment._id,
+                });
+              }
+            });
+          }
+        } else {
+          // All failed or unexpected error
+          validDocuments.forEach((doc) => {
+            const originalDoc = shipmentDocuments.find(
+              (d) => d.data.chassisNumber === doc.chassisNumber
+            );
+            if (originalDoc) {
+              results.failed.push({
+                index: originalDoc.index,
+                chassisNo: doc.chassisNumber,
+                error: err.message || "Failed to create shipment",
+              });
+            }
+          });
+        }
+      }
+    }
+
+    // Return response
+    const response = {
+      success: results.failed.length === 0,
+      message:
+        results.failed.length === 0
+          ? `Successfully created ${results.successful.length} shipment(s)`
+          : `Created ${results.successful.length} shipment(s), ${results.failed.length} failed`,
+      data: {
+        successful: results.successful,
+        failed: results.failed,
+        total: shipmentsData.length,
+        successCount: results.successful.length,
+        failureCount: results.failed.length,
+      },
+    };
+
+    const statusCode = results.failed.length === 0 ? 201 : 207; // 207 Multi-Status
+    return res.status(statusCode).json(response);
+  } catch (err) {
+    throw ApiError.badRequest(err.message || "Failed to create bulk shipments");
+  }
+});
+
+/**
  * Update an existing shipment (safe + rollback-proof)
  */
 const sanitizeInput = (obj) => {
