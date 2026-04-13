@@ -1880,53 +1880,94 @@ exports.bulkAssignVessel = asyncHandler(async (req, res) => {
 });
 
 /**
- * Bulk assign gate out date to multiple shipments
+ * Bulk update gate out date and/or export status on multiple shipments.
+ * At least one of gateOutDate or exportStatus must be provided.
  */
 exports.bulkAssignGateOutDate = asyncHandler(async (req, res) => {
-  const { shipmentIds, gateOutDate } = req.body;
+  const { shipmentIds, gateOutDate, exportStatus } = req.body;
 
   if (!Array.isArray(shipmentIds) || shipmentIds.length === 0) {
     throw ApiError.badRequest("Please provide shipment IDs");
   }
 
-  if (!gateOutDate) {
-    throw ApiError.badRequest("Gate out date is required");
+  const hasGateOut =
+    gateOutDate !== undefined &&
+    gateOutDate !== null &&
+    String(gateOutDate).trim() !== "";
+  const hasStatus =
+    exportStatus !== undefined &&
+    exportStatus !== null &&
+    String(exportStatus).trim() !== "";
+
+  if (!hasGateOut && !hasStatus) {
+    throw ApiError.badRequest(
+      "Provide a gate out date and/or an export status to update"
+    );
   }
 
-  const gateOut = new Date(gateOutDate);
+  let gateOut = null;
+  if (hasGateOut) {
+    gateOut = new Date(gateOutDate);
+    if (Number.isNaN(gateOut.getTime())) {
+      throw ApiError.badRequest("Invalid gate out date");
+    }
+  }
 
-  // Fetch shipments to calculate storage days
+  const normalizedStatus = hasStatus ? String(exportStatus).trim() : null;
+  if (hasStatus && !VALID_EXPORT_STATUSES.includes(normalizedStatus)) {
+    throw ApiError.badRequest("Invalid export status");
+  }
+
   const shipments = await Shipment.find({ _id: { $in: shipmentIds } });
 
   if (shipments.length === 0) {
     throw ApiError.notFound("No shipments found");
   }
 
-  // Update each shipment with gate out date and recalculate storage days
-  const updatePromises = shipments.map(async (shipment) => {
-    const storageDays = shipment.gateInDate
-      ? calculateStoragePeriod(shipment.gateInDate, gateOut)
-      : 0;
+  if (hasGateOut) {
+    for (const shipment of shipments) {
+      if (
+        shipment.gateInDate &&
+        gateOut < new Date(shipment.gateInDate)
+      ) {
+        throw ApiError.badRequest(
+          `Gate out date cannot be earlier than gate in date (${shipment.chassisNumber || shipment._id})`
+        );
+      }
+    }
+  }
 
+  const updatePromises = shipments.map((shipment) => {
+    const $set = {};
+    if (hasGateOut) {
+      $set.gateOutDate = gateOut;
+      $set.storageDays = shipment.gateInDate
+        ? calculateStoragePeriod(shipment.gateInDate, gateOut)
+        : 0;
+    }
+    if (hasStatus) {
+      $set.exportStatus = normalizedStatus;
+    }
     return Shipment.findByIdAndUpdate(
       shipment._id,
-      {
-        $set: {
-          gateOutDate: gateOut,
-          storageDays: storageDays,
-        },
-      },
+      { $set },
       { new: true }
     );
   });
 
   await Promise.all(updatePromises);
 
+  const parts = [];
+  if (hasGateOut) parts.push("gate out date");
+  if (hasStatus) parts.push("export status");
+  const summary = parts.join(" and ");
+
   const response = ApiResponse.success(
-    `Gate out date assigned to ${shipments.length} shipment(s)`,
+    `Updated ${summary} for ${shipments.length} shipment(s)`,
     {
       updatedCount: shipments.length,
-      gateOutDate: gateOut,
+      ...(hasGateOut ? { gateOutDate: gateOut } : {}),
+      ...(hasStatus ? { exportStatus: normalizedStatus } : {}),
     }
   );
 
